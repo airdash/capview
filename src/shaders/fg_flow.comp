@@ -1,0 +1,79 @@
+#version 450
+// Hierarchical block-matching optical flow.
+// Each work group = one 16x16 block, 16 threads (one per row).
+// Uses texelFetch with explicit LOD for luminance comparison.
+
+layout(local_size_x = 16, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uPrev;
+layout(set = 0, binding = 1) uniform sampler2D uCurr;
+layout(set = 0, binding = 2) uniform sampler2D uHintMV;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D uMV;
+
+layout(push_constant) uniform PC {
+    ivec2 uSize;
+    int uRadius;
+    int uHasHint;
+    int uLevel;
+};
+
+const int BLOCK = 16;
+
+shared float rowSAD[16];
+
+void main() {
+    ivec2 blockId = ivec2(gl_WorkGroupID.xy);
+    int row = int(gl_LocalInvocationID.x);
+    ivec2 origin = blockId * BLOCK;
+
+    int bw = min(BLOCK, uSize.x - origin.x);
+    int bh = min(BLOCK, uSize.y - origin.y);
+
+    // Seed from coarser level (motion scaled x2 for finer grid)
+    ivec2 hintOff = ivec2(0);
+    if (uHasHint != 0) {
+        ivec2 hintBlock = blockId / 2;
+        vec4 hintData = texelFetch(uHintMV, hintBlock, 0);
+        hintOff = ivec2(round(hintData.xy * 2.0));
+    }
+
+    float bestSAD = 1e30;
+    ivec2 bestOff = hintOff;
+
+    for (int dy = -uRadius; dy <= uRadius; dy++) {
+        for (int dx = -uRadius; dx <= uRadius; dx++) {
+            ivec2 testOff = hintOff + ivec2(dx, dy);
+
+            float mySAD = 0.0;
+            if (row < bh) {
+                int py = origin.y + row;
+                int qy = clamp(py + testOff.y, 0, uSize.y - 1);
+                for (int bx = 0; bx < bw; bx++) {
+                    int px = origin.x + bx;
+                    int qx = clamp(px + testOff.x, 0, uSize.x - 1);
+                    float lP = texelFetch(uPrev, ivec2(px, py), uLevel).g;
+                    float lQ = texelFetch(uCurr, ivec2(qx, qy), uLevel).g;
+                    mySAD += abs(lP - lQ);
+                }
+            }
+
+            rowSAD[row] = mySAD;
+            barrier();
+
+            if (row == 0) {
+                float total = 0.0;
+                for (int i = 0; i < 16; i++) total += rowSAD[i];
+                if (total < bestSAD) {
+                    bestSAD = total;
+                    bestOff = testOff;
+                }
+            }
+            barrier();
+        }
+    }
+
+    if (row == 0) {
+        float normSAD = bestSAD / 256.0;
+        imageStore(uMV, blockId, vec4(float(bestOff.x), float(bestOff.y), normSAD, 0.0));
+    }
+}

@@ -1,0 +1,27 @@
+# Build artifacts
+/target
+/build-output
+
+# Third-party build artifacts (but not submodules tracked in .gitmodules)
+/3rdparty/*
+!/3rdparty/moltenvk
+
+# Docker-generated SPIR-V (Dockerfile compiles these from .comp sources)
+src/shaders/fg_*.spv
+
+# Secrets / credentials
+*.pem
+*.key
+.env
+.env.*
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

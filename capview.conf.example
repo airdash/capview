@@ -1,0 +1,44 @@
+# capview defaults — edit to taste, CLI flags always override.
+#
+# Boolean values: true/yes/1 to enable, anything else to disable.
+#
+# Top-level keys are global defaults. Named [profile] sections override them.
+# Usage: capview --profile hdmi
+#
+# audio_device matches by substring against PulseAudio/PipeWire source
+# descriptions (case-insensitive). Use 'pactl list sources short' to see
+# available sources.
+#
+# max_volume caps PageUp volume adjustment (default 100). Raise above
+# 100 only if the source is unusually quiet — values over 100 amplify
+# digitally and may clip.
+
+# device       = /dev/video0
+# width        = 1920
+# height       = 1080
+# fps          = 60
+# format       = nv12
+# buffers      = 2
+# window       = 960x540
+# audio_device =
+# max_volume   = 100
+vsync      = false
+smooth     = false
+fullscreen = false
+quiet      = false
+daemonize  = false
+
+# Example profiles:
+#
+# [hdmi]
+# device       = /dev/video2
+# width        = 1920
+# height       = 1080
+# fps          = 60
+# audio_device = capture card
+#
+# [webcam]
+# device       = /dev/video0
+# width        = 1280
+# height       = 720
+# fps          = 30

@@ -1,0 +1,47 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D inputTex;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D outputImg;
+
+layout(push_constant) uniform PC {
+    uint srcW, srcH, dstW, dstH;
+    float sharpness, brightness, contrast, invGamma;
+};
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    if (pos.x >= int(dstW) || pos.y >= int(dstH)) return;
+
+    // Map output pixel to input UV (bilinear via sampler)
+    vec2 uv = (vec2(pos) + 0.5) / vec2(dstW, dstH);
+    vec2 srcCoord = uv * vec2(srcW, srcH);
+    vec2 texel = 1.0 / vec2(srcW, srcH);
+
+    // CAS: sample center + 4 cardinal neighbors
+    vec3 c = texture(inputTex, uv).rgb;
+    vec3 n = texture(inputTex, uv + vec2(0, -texel.y)).rgb;
+    vec3 s = texture(inputTex, uv + vec2(0,  texel.y)).rgb;
+    vec3 e = texture(inputTex, uv + vec2( texel.x, 0)).rgb;
+    vec3 w = texture(inputTex, uv + vec2(-texel.x, 0)).rgb;
+
+    // Local min/max
+    vec3 mn = min(min(n, s), min(e, w));
+    vec3 mx = max(max(n, s), max(e, w));
+    mn = min(mn, c);
+    mx = max(mx, c);
+
+    // AMD CAS sharpening weight:
+    //   w = sqrt(min(mn/mx, (1-mx)/(1-mn)))
+    // Clamped to avoid division by zero
+    vec3 amp = sqrt(clamp(min(mn / (mx + 1e-5), (1.0 - mx) / (1.0 - mn + 1e-5)), 0.0, 1.0));
+    amp *= -sharpness * 0.125;
+
+    vec3 result = (c + (n + s + e + w) * amp) / (1.0 + 4.0 * amp);
+
+    // Apply brightness, contrast, gamma
+    result = clamp(((result - 0.5) * contrast + 0.5) * brightness, 0.0, 1.0);
+    result = pow(result, vec3(invGamma));
+
+    imageStore(outputImg, pos, vec4(result, 1.0));
+}

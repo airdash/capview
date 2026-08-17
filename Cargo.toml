@@ -1,0 +1,33 @@
+[package]
+name = "capview"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal low-latency v4l2 capture card viewer"
+license = "Unlicense"
+
+[dependencies]
+sdl2 = "0.37"
+sdl2-sys = "0.37"
+libc = "0.2"
+clap = { version = "4.4", features = ["derive"] }
+anyhow = "1"
+flate2 = { version = "1", default-features = false, features = ["zlib"] }
+glow = "0.14"
+ash = "0.38"
+libloading = "0.8"
+ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["std", "ndarray", "half"] }
+ndarray = { version = "0.17", optional = true, features = ["std"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client = "0.31"
+wayland-backend = "0.3"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+
+[features]
+default = []
+rife = ["ort", "ndarray"]
+
+[profile.release]
+lto = true
+strip = true

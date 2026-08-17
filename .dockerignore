@@ -1,0 +1,7 @@
+dist/
+*.tar.gz
+*.o
+capview
+README.md
+.git/
+target/

@@ -1,0 +1,3 @@
+[submodule "3rdparty/moltenvk"]
+	path = 3rdparty/moltenvk
+	url = https://github.com/KhronosGroup/MoltenVK.git

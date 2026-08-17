@@ -1,0 +1,57 @@
+#version 450
+// 3x3 weighted median filter on MV field with temporal dampening.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uMVIn;
+layout(set = 0, binding = 1) uniform sampler2D uMVPrev;
+// binding 2 unused (shared layout with flow/synth)
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D uMVOut;
+
+layout(push_constant) uniform PC {
+    ivec2 uMVSize;
+    int uHasPrev;
+};
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    if (pos.x >= uMVSize.x || pos.y >= uMVSize.y) return;
+
+    vec2 mvs[9];
+    float weights[9];
+    int count = 0;
+
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            ivec2 p = clamp(pos + ivec2(dx, dy), ivec2(0), uMVSize - 1);
+            vec4 data = texelFetch(uMVIn, p, 0);
+            mvs[count] = data.xy;
+            float w = (dx == 0 && dy == 0) ? 2.0 : 1.0;
+            w /= (data.z + 0.001);
+            weights[count] = w;
+            count++;
+        }
+    }
+
+    float bestCost = 1e30;
+    vec2 bestMV = mvs[4];
+    for (int i = 0; i < 9; i++) {
+        float cost = 0.0;
+        for (int j = 0; j < 9; j++) {
+            vec2 d = mvs[i] - mvs[j];
+            cost += weights[j] * (abs(d.x) + abs(d.y));
+        }
+        if (cost < bestCost) {
+            bestCost = cost;
+            bestMV = mvs[i];
+        }
+    }
+
+    if (uHasPrev != 0) {
+        vec4 prevData = texelFetch(uMVPrev, pos, 0);
+        bestMV = mix(prevData.xy, bestMV, 0.7);
+    }
+
+    float centerSAD = texelFetch(uMVIn, pos, 0).z;
+    imageStore(uMVOut, pos, vec4(bestMV, centerSAD, 0.0));
+}

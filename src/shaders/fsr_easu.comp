@@ -1,0 +1,218 @@
+#version 450
+// AMD FidelityFX Super Resolution [FSR 1] - EASU (Edge Adaptive Spatial Upsampling)
+// Ported from ffx_fsr1.h v1.20210629
+//
+// Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved.
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D inputTex;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D outputImg;
+
+layout(push_constant) uniform PC {
+    // Constants from FsrEasuCon():
+    // con0.xy = viewport/output (scale), con0.zw = 0.5*scale - 0.5 (offset)
+    // con1.xy = 1/inputSize (used for texel→UV and bounds recovery)
+    // con1.zw, con2, con3 = gather4 offsets (not used with texelFetch path)
+    uvec4 con0, con1, con2, con3;
+};
+
+// AMD ffx_a.h helpers
+float APrxLoRcpF1(float a) { return uintBitsToFloat(uint(0x7ef07ebb) - floatBitsToUint(a)); }
+float APrxLoRsqF1(float a) { return uintBitsToFloat(uint(0x5f347d74) - (floatBitsToUint(a) >> 1)); }
+
+// Filtering for a given tap (from AMD FsrEasuTapF).
+// Modified lanczos2 kernel approximation:
+//   (25/16 * (2/5 * x^2 - 1)^2 - (25/16 - 1)) * (1/4 * x^2 - 1)^2
+void FsrEasuTapF(
+    inout vec3 aC, inout float aW,
+    vec2 off,    // pixel offset from resolve position to tap
+    vec2 dir,    // gradient direction
+    vec2 len,    // anisotropic length
+    float lob,   // negative lobe strength
+    float clp,   // clipping point
+    vec3 c       // tap color
+) {
+    // Rotate offset by direction
+    vec2 v;
+    v.x = off.x * dir.x + off.y * dir.y;
+    v.y = off.x * (-dir.y) + off.y * dir.x;
+    // Anisotropy
+    v *= len;
+    // Distance^2, limited to window
+    float d2 = min(v.x * v.x + v.y * v.y, clp);
+    // Approximation of lanczos2
+    float wB = 2.0 / 5.0 * d2 - 1.0;
+    float wA = lob * d2 - 1.0;
+    wB *= wB;
+    wA *= wA;
+    wB = 25.0 / 16.0 * wB - (25.0 / 16.0 - 1.0);
+    float w = wB * wA;
+    // Weighted average
+    aC += c * w;
+    aW += w;
+}
+
+// Accumulate direction and length (from AMD FsrEasuSetF).
+// Processes a 5-tap cross pattern:
+//    a
+//  b c d
+//    e
+void FsrEasuSetF(
+    inout vec2 dir,
+    inout float len,
+    float w,       // bilinear weight for this quadrant
+    float lA, float lB, float lC, float lD, float lE
+) {
+    // Horizontal gradient direction and consistency
+    float dc = lD - lC;
+    float cb = lC - lB;
+    float lenX = max(abs(dc), abs(cb));
+    lenX = APrxLoRcpF1(lenX);
+    float dirX = lD - lB;
+    dir.x += dirX * w;
+    lenX = clamp(abs(dirX) * lenX, 0.0, 1.0);
+    lenX *= lenX;
+    len += lenX * w;
+    // Vertical gradient direction and consistency
+    float ec = lE - lC;
+    float ca = lC - lA;
+    float lenY = max(abs(ec), abs(ca));
+    lenY = APrxLoRcpF1(lenY);
+    float dirY = lE - lA;
+    dir.y += dirY * w;
+    lenY = clamp(abs(dirY) * lenY, 0.0, 1.0);
+    lenY *= lenY;
+    len += lenY * w;
+}
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+
+    // Decode con0: scale and offset for output→input mapping
+    vec2 scale  = vec2(uintBitsToFloat(con0.x), uintBitsToFloat(con0.y));
+    vec2 offset = vec2(uintBitsToFloat(con0.z), uintBitsToFloat(con0.w));
+
+    // Recover output dimensions from con1 (1/inputW, 1/inputH) and scale (inputW/outputW)
+    float rcpInputW = uintBitsToFloat(con1.x);
+    float rcpInputH = uintBitsToFloat(con1.y);
+    int outputW = int(round(1.0 / (rcpInputW * scale.x)));  // inputW / (inputW/outputW) doesn't work, need outputW directly
+    int outputH = int(round(1.0 / (rcpInputH * scale.y)));
+
+    // Workaround: compute output dims from scale ratio
+    // scale = inputW/outputW → outputW = inputW/scale = (1/rcpInputW)/scale
+    // But float precision is tricky. Use image size as fallback.
+    ivec2 outSize = imageSize(outputImg);
+    if (pos.x >= outSize.x || pos.y >= outSize.y) return;
+
+    // Get position of 'f' (the nearest input texel)
+    vec2 pp = vec2(pos) * scale + offset;
+    vec2 fp = floor(pp);
+    pp -= fp;
+    ivec2 sp = ivec2(fp);
+
+    // 12-tap kernel layout:
+    //    b c
+    //  e f g h
+    //  i j k l
+    //    n o
+    vec3 bC = texelFetch(inputTex, sp + ivec2( 0, -1), 0).rgb;
+    vec3 cC = texelFetch(inputTex, sp + ivec2( 1, -1), 0).rgb;
+    vec3 eC = texelFetch(inputTex, sp + ivec2(-1,  0), 0).rgb;
+    vec3 fC = texelFetch(inputTex, sp + ivec2( 0,  0), 0).rgb;
+    vec3 gC = texelFetch(inputTex, sp + ivec2( 1,  0), 0).rgb;
+    vec3 hC = texelFetch(inputTex, sp + ivec2( 2,  0), 0).rgb;
+    vec3 iC = texelFetch(inputTex, sp + ivec2(-1,  1), 0).rgb;
+    vec3 jC = texelFetch(inputTex, sp + ivec2( 0,  1), 0).rgb;
+    vec3 kC = texelFetch(inputTex, sp + ivec2( 1,  1), 0).rgb;
+    vec3 lC = texelFetch(inputTex, sp + ivec2( 2,  1), 0).rgb;
+    vec3 nC = texelFetch(inputTex, sp + ivec2( 0,  2), 0).rgb;
+    vec3 oC = texelFetch(inputTex, sp + ivec2( 1,  2), 0).rgb;
+
+    // Approximate luma (luma×2 in 2 FMA, matching AMD reference)
+    float bL = bC.b * 0.5 + (bC.r * 0.5 + bC.g);
+    float cL = cC.b * 0.5 + (cC.r * 0.5 + cC.g);
+    float eL = eC.b * 0.5 + (eC.r * 0.5 + eC.g);
+    float fL = fC.b * 0.5 + (fC.r * 0.5 + fC.g);
+    float gL = gC.b * 0.5 + (gC.r * 0.5 + gC.g);
+    float hL = hC.b * 0.5 + (hC.r * 0.5 + hC.g);
+    float iL = iC.b * 0.5 + (iC.r * 0.5 + iC.g);
+    float jL = jC.b * 0.5 + (jC.r * 0.5 + jC.g);
+    float kL = kC.b * 0.5 + (kC.r * 0.5 + kC.g);
+    float lL = lC.b * 0.5 + (lC.r * 0.5 + lC.g);
+    float nL = nC.b * 0.5 + (nC.r * 0.5 + nC.g);
+    float oL = oC.b * 0.5 + (oC.r * 0.5 + oC.g);
+
+    // Accumulate edge direction and anisotropy for bilinear interpolation.
+    // 4 quadrants, each with a 5-tap cross centered on one of the nearest 2×2 texels (f,g,j,k).
+    vec2 dir = vec2(0.0);
+    float len = 0.0;
+    //              bilinear weight              a   b   c   d   e
+    FsrEasuSetF(dir, len, (1.0 - pp.x) * (1.0 - pp.y), bL, eL, fL, gL, jL); // cross at f
+    FsrEasuSetF(dir, len,        pp.x  * (1.0 - pp.y), cL, fL, gL, hL, kL); // cross at g
+    FsrEasuSetF(dir, len, (1.0 - pp.x) *        pp.y,  fL, iL, jL, kL, nL); // cross at j
+    FsrEasuSetF(dir, len,        pp.x  *        pp.y,   gL, jL, kL, lL, oL); // cross at k
+
+    // Normalize with approximation, and cleanup close to zero
+    vec2 dir2 = dir * dir;
+    float dirR = dir2.x + dir2.y;
+    bool zro = dirR < (1.0 / 32768.0);
+    dirR = APrxLoRsqF1(dirR);
+    dirR = zro ? 1.0 : dirR;
+    dir.x = zro ? 1.0 : dir.x;
+    dir *= vec2(dirR);
+    // Transform from {0 to 2} to {0 to 1} range, and shape with square
+    len = len * 0.5;
+    len *= len;
+    // Stretch kernel {1.0 vert|horz, to sqrt(2.0) on diagonal}
+    float stretch = (dir.x * dir.x + dir.y * dir.y) * APrxLoRcpF1(max(abs(dir.x), abs(dir.y)));
+    // Anisotropic length after rotation:
+    //  x := 1.0 lerp to 'stretch' on edges
+    //  y := 1.0 lerp to 2x on edges
+    vec2 len2 = vec2(1.0 + (stretch - 1.0) * len, 1.0 - 0.5 * len);
+    // Based on the amount of 'edge', the window shifts from +/-{sqrt(2) to slightly beyond 2.0}
+    float lob = 0.5 + ((1.0 / 4.0 - 0.04) - 0.5) * len;
+    // Set distance^2 clipping point to the end of the adjustable window
+    float clp = APrxLoRcpF1(lob);
+
+    // Min/max of nearest 2×2 for de-ringing
+    vec3 min4 = min(min(min(fC, gC), jC), kC);
+    vec3 max4 = max(max(max(fC, gC), jC), kC);
+
+    // Accumulate 12 taps with the directional kernel
+    vec3 aC = vec3(0.0);
+    float aW = 0.0;
+    FsrEasuTapF(aC, aW, vec2( 0.0, -1.0) - pp, dir, len2, lob, clp, bC); // b
+    FsrEasuTapF(aC, aW, vec2( 1.0, -1.0) - pp, dir, len2, lob, clp, cC); // c
+    FsrEasuTapF(aC, aW, vec2(-1.0,  1.0) - pp, dir, len2, lob, clp, iC); // i
+    FsrEasuTapF(aC, aW, vec2( 0.0,  1.0) - pp, dir, len2, lob, clp, jC); // j
+    FsrEasuTapF(aC, aW, vec2( 0.0,  0.0) - pp, dir, len2, lob, clp, fC); // f
+    FsrEasuTapF(aC, aW, vec2(-1.0,  0.0) - pp, dir, len2, lob, clp, eC); // e
+    FsrEasuTapF(aC, aW, vec2( 1.0,  1.0) - pp, dir, len2, lob, clp, kC); // k
+    FsrEasuTapF(aC, aW, vec2( 2.0,  1.0) - pp, dir, len2, lob, clp, lC); // l
+    FsrEasuTapF(aC, aW, vec2( 2.0,  0.0) - pp, dir, len2, lob, clp, hC); // h
+    FsrEasuTapF(aC, aW, vec2( 1.0,  0.0) - pp, dir, len2, lob, clp, gC); // g
+    FsrEasuTapF(aC, aW, vec2( 1.0,  2.0) - pp, dir, len2, lob, clp, oC); // o
+    FsrEasuTapF(aC, aW, vec2( 0.0,  2.0) - pp, dir, len2, lob, clp, nC); // n
+
+    // Normalize and de-ring (clamp to nearest 2×2 min/max)
+    vec3 result = aC * (1.0 / max(aW, 1e-5));
+    result = min(max4, max(min4, result));
+
+    imageStore(outputImg, pos, vec4(result, 1.0));
+}

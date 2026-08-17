@@ -1,0 +1,65 @@
+#version 450
+// Motion-compensated frame synthesis.
+// One invocation per output pixel (8x8 work groups).
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uPrev;
+layout(set = 0, binding = 1) uniform sampler2D uCurr;
+layout(set = 0, binding = 2) uniform sampler2D uMV;
+layout(set = 0, binding = 3, rgba8) uniform writeonly image2D uOut;
+
+layout(push_constant) uniform PC {
+    ivec2 uSize;
+    float uT;    // 0.0 = prev, 1.0 = curr, 0.5 = midpoint
+    int uMode;   // 0 = extrapolate, 1 = interpolate
+};
+
+const int BLOCK = 16;
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    if (pos.x >= uSize.x || pos.y >= uSize.y) return;
+
+    vec2 invSize = 1.0 / vec2(uSize);
+
+    // Bilinear interpolation of MVs across block boundaries
+    vec2 mvSize = vec2(textureSize(uMV, 0));
+    vec2 mvUV = (vec2(pos) / float(BLOCK) + 0.5) / mvSize;
+    vec4 mvData = texture(uMV, mvUV);
+    vec2 mv = mvData.xy;
+    float sad = mvData.z;
+
+    // Confidence: smooth sigmoid
+    float confidence = 1.0 / (1.0 + exp((sad - 0.15) * 20.0));
+
+    vec4 warped;
+    vec4 source;
+
+    if (uMode == 0) {
+        // Extrapolation: predict frame beyond curr by continuing motion.
+        // Inverse warp: output pixel at pos came from pos - mv*t in curr.
+        vec2 srcPos = vec2(pos) - mv * uT;
+        vec2 srcUV = (srcPos + 0.5) * invSize;
+        warped = textureLod(uCurr, srcUV, 0.0);
+        source = textureLod(uCurr, (vec2(pos) + 0.5) * invSize, 0.0);
+    } else {
+        // Interpolation: blend forward-warped prev and backward-warped curr.
+        // Forward warp from prev: pixel at p in prev is at p+mv*t at time t.
+        vec2 fwdPos = vec2(pos) - mv * uT;
+        vec2 fwdUV = (fwdPos + 0.5) * invSize;
+        vec4 fwd = textureLod(uPrev, fwdUV, 0.0);
+
+        // Backward warp from curr: pixel at p+mv in curr was at p+mv*t at time t.
+        vec2 bwdPos = vec2(pos) + mv * (1.0 - uT);
+        vec2 bwdUV = (bwdPos + 0.5) * invSize;
+        vec4 bwd = textureLod(uCurr, bwdUV, 0.0);
+
+        warped = mix(fwd, bwd, uT);
+        vec2 origUV = (vec2(pos) + 0.5) * invSize;
+        source = mix(textureLod(uPrev, origUV, 0.0), textureLod(uCurr, origUV, 0.0), uT);
+    }
+
+    vec4 result = mix(source, warped, confidence);
+    imageStore(uOut, pos, result);
+}

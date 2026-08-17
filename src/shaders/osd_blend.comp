@@ -1,0 +1,26 @@
+#version 450
+// OSD alpha-blend composite: reads destination + OSD, writes blended result.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D osdTex;
+layout(set = 0, binding = 1, rgba8) uniform image2D dstImg;
+
+layout(push_constant) uniform PC {
+    uint dstW, dstH;
+};
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    if (pos.x >= int(dstW) || pos.y >= int(dstH)) return;
+
+    // Sample OSD (B8G8R8A8 format — Vulkan returns correct RGBA via format)
+    vec2 uv = (vec2(pos) + 0.5) / vec2(dstW, dstH);
+    vec4 osd = texture(osdTex, uv);
+
+    if (osd.a < 1.0 / 255.0) return; // fully transparent — skip
+
+    vec4 dst = imageLoad(dstImg, pos);
+    vec3 blended = mix(dst.rgb, osd.rgb, osd.a);
+    imageStore(dstImg, pos, vec4(blended, 1.0));
+}
