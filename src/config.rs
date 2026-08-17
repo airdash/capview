@@ -747,3 +747,60 @@ fn atomic_write(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> 
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_bool_accepts_truthy_only() {
+        for v in ["true", "1", "yes"] {
+            assert!(parse_bool(v), "{v} should be true");
+        }
+        for v in ["false", "0", "no", "off", "TRUE", ""] {
+            assert!(!parse_bool(v), "{v} should be false");
+        }
+    }
+
+    #[test]
+    fn priority_flags_keywords() {
+        assert_eq!(PriorityFlags::parse("all"), PriorityFlags::ALL);
+        assert_eq!(PriorityFlags::parse("  ALL "), PriorityFlags::ALL);
+        assert_eq!(PriorityFlags::parse("none"), PriorityFlags::NONE);
+        assert_eq!(PriorityFlags::parse("off"), PriorityFlags::NONE);
+    }
+
+    #[test]
+    fn priority_flags_list_and_aliases() {
+        let f = PriorityFlags::parse("rt, mlock,ioprio");
+        assert!(f.has(PriorityFlags::REALTIME));
+        assert!(f.has(PriorityFlags::MLOCK));
+        assert!(f.has(PriorityFlags::IO_PRIO));
+        assert!(!f.has(PriorityFlags::CPU_PIN));
+        // Unknown tokens are warned about but ignored, not fatal.
+        assert_eq!(PriorityFlags::parse("bogus"), PriorityFlags::NONE);
+    }
+
+    #[test]
+    fn pixfmt_known_and_fallback() {
+        assert_eq!(parse_pixfmt("nv12", 1).unwrap(), V4L2_PIX_FMT_NV12);
+        assert_eq!(parse_pixfmt("YUY2", 1).unwrap(), V4L2_PIX_FMT_YUYV);
+        assert_eq!(parse_pixfmt("mjpg", 1).unwrap(), V4L2_PIX_FMT_MJPEG);
+        // Unknown formats fall back to NV12 rather than erroring.
+        assert_eq!(parse_pixfmt("bogus", 1).unwrap(), V4L2_PIX_FMT_NV12);
+    }
+
+    #[test]
+    fn apply_config_key_parses_and_clamps() {
+        let mut cfg = Config::default();
+        apply_config_key(&mut cfg, "width", "2560", 1).unwrap();
+        assert_eq!(cfg.width, 2560);
+        apply_config_key(&mut cfg, "buffers", "99", 1).unwrap();
+        assert_eq!(cfg.buffers, MAX_BUFFERS);
+        apply_config_key(&mut cfg, "window", "960x540", 1).unwrap();
+        assert_eq!((cfg.win_w, cfg.win_h), (Some(960), Some(540)));
+        apply_config_key(&mut cfg, "vsync", "yes", 1).unwrap();
+        assert!(cfg.vsync);
+        assert!(apply_config_key(&mut cfg, "fps", "not-a-number", 1).is_err());
+    }
+}

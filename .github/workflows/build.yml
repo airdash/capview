@@ -1,0 +1,146 @@
+# =============================================================================
+# capview CI/CD
+#
+# capview is a desktop GUI binary (Wayland/SDL2/Vulkan), NOT a container
+# service — so there is no docker/registry image. Pushes to main and PRs
+# publish downloadable binary artifacts; git tags (vX.Y.Z) additionally cut
+# a GitHub Release with the binaries attached.
+#
+# Mirrors the GitLab pipeline in ~/Projects/apps/capview (build:linux /
+# build:macos / release), with GitHub-hosted runners instead of the k8s and
+# self-managed macOS runners.
+# =============================================================================
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Pinned to the same toolchain as the Dockerfile (rust:1.94-bookworm).
+  RUST_TOOLCHAIN: "1.94"
+  # System build deps — kept in lockstep with Dockerfile (source of truth).
+  LINUX_BUILD_DEPS: >-
+    libsdl2-dev libwayland-dev wayland-protocols zlib1g-dev libpulse-dev
+    libgl-dev libegl-dev libvulkan-dev libturbojpeg0-dev glslang-tools
+    pkg-config file
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${LINUX_BUILD_DEPS}
+      - name: Pin Rust toolchain
+        run: |
+          rustup toolchain install ${RUST_TOOLCHAIN} --profile minimal
+          rustup default ${RUST_TOOLCHAIN}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: test-cargo-${{ hashFiles('Cargo.lock') }}
+      # fg_*.spv are gitignored and required by include_bytes! — compile first.
+      - name: Compile shaders
+        run: ./scripts/compile-shaders.sh
+      - name: Run tests
+        run: cargo test
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: capview-linux-x86_64
+          - os: macos-latest
+            artifact: capview-macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${LINUX_BUILD_DEPS}
+      - name: Install build deps (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: brew install sdl2 glslang
+      - name: Pin Rust toolchain
+        run: |
+          rustup toolchain install ${RUST_TOOLCHAIN} --profile minimal
+          rustup default ${RUST_TOOLCHAIN}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.artifact }}-cargo-${{ hashFiles('Cargo.lock') }}
+      # Reproducible build timestamp for the OSD version stamp (build.rs honours it).
+      - name: Set SOURCE_DATE_EPOCH
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
+      # fg_*.spv are gitignored and required by include_bytes! — compile first.
+      - name: Compile shaders
+        run: ./scripts/compile-shaders.sh
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release
+          strip target/release/capview
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          make macos
+          strip target/release/capview || true
+      # clap parses args before any device/display init, so --help must work
+      # headless on both platforms; a broken binary fails here, not at release.
+      - name: Smoke test binary
+        run: |
+          file target/release/capview
+          ./target/release/capview --help
+      - name: Stage artifact
+        run: install -Dm755 target/release/capview "build-output/${{ matrix.artifact }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: build-output/${{ matrix.artifact }}
+          retention-days: 30
+          if-no-files-found: error
+
+  # On tags, publish the binaries as a GitHub Release (GitLab pattern:
+  # generic package registry + release-cli; here gh + release assets).
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: build-output
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --title "capview ${GITHUB_REF_NAME}" \
+            --notes "Automated release for ${GITHUB_REF_NAME}. Binaries attached below." \
+            build-output/*

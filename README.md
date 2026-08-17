@@ -1,5 +1,7 @@
 # capview
 
+! Still WIP, here be bugs.
+
 Minimal low-latency v4l2 capture card viewer. No demuxer, no decoder, no frame
 queue, no threading. Just a tight DQBUF→texture→present loop on top of SDL2.
 
